@@ -1,0 +1,15 @@
+{
+  "name": "cupduel",
+  "version": "1.0.0",
+  "description": "CupDuel — Telegram Mini App multiplayer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.17.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
