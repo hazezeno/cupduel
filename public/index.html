@@ -667,13 +667,39 @@ const WS_URL = location.protocol === 'https:'
 
 let ws = null;
 let wsReady = false;
+let offlineMode = false; // режим без сервера — играем с ботами
+
+const BOTS = [
+  {tg_id:-1, username:'Максим К.', avatar:'🦊'},
+  {tg_id:-2, username:'Анна Т.',   avatar:'🦅'},
+  {tg_id:-3, username:'Дмитрий В.',avatar:'🐉'},
+  {tg_id:-4, username:'Алина С.',  avatar:'🌙'},
+  {tg_id:-5, username:'Алексей Р.',avatar:'⚡'},
+];
 
 function wsConnect() {
-  ws = new WebSocket(WS_URL);
+  // Если открыто как файл (file://) или как артефакт — сразу оффлайн режим
+  if (location.protocol === 'file:' || location.hostname === 'claude.site'
+      || location.hostname.includes('claude') || location.hostname === '') {
+    startOfflineMode();
+    return;
+  }
+
+  try {
+    ws = new WebSocket(WS_URL);
+  } catch(e) {
+    startOfflineMode();
+    return;
+  }
+
+  // Если за 3 секунды не подключился — уходим в оффлайн
+  const timeout = setTimeout(() => {
+    if (!wsReady) { ws?.close(); startOfflineMode(); }
+  }, 3000);
 
   ws.onopen = () => {
+    clearTimeout(timeout);
     wsReady = true;
-    // авторизуемся — берём данные из Telegram WebApp или fallback для теста
     const tg = window.Telegram?.WebApp?.initDataUnsafe?.user;
     const me = tg
       ? { tg_id: tg.id, username: tg.first_name || tg.username, avatar: '🎮' }
@@ -689,18 +715,210 @@ function wsConnect() {
   };
 
   ws.onclose = () => {
+    clearTimeout(timeout);
+    if (!wsReady && !offlineMode) { startOfflineMode(); return; }
     wsReady = false;
-    showToast('⚠️ Соединение потеряно. Переподключение...', '');
-    setTimeout(wsConnect, 3000);
+    if (!offlineMode) {
+      showToast('⚠️ Соединение потеряно. Переподключение...', '');
+      setTimeout(wsConnect, 3000);
+    }
   };
 
-  ws.onerror = () => ws.close();
+  ws.onerror = () => { clearTimeout(timeout); ws.close(); };
+}
+
+// ════════════════════ OFFLINE MODE (с ботами) ════════════════════
+function startOfflineMode() {
+  offlineMode = true;
+  state.me = { tg_id: 1, username: 'Вы', avatar: '😎' };
+  state.balance = 1000;
+  // генерируем несколько дуэлей от ботов
+  const stakes = [50, 100, 200, 500];
+  state.duels = BOTS.slice(0,3).map((bot, i) => ({
+    id: '#BOT' + (i+1),
+    creator_id: bot.tg_id,
+    stake: stakes[i % stakes.length],
+    status: 'waiting',
+    _bot: bot,
+  }));
+  renderLobby();
+  showScreen('screen-lobby');
 }
 
 function wsSend(type, payload) {
+  if (offlineMode) { handleOffline(type, payload); return; }
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type, payload }));
   }
+}
+
+// ── Оффлайн обработчик (имитирует сервер) ──
+function handleOffline(type, payload) {
+  if (type === 'create_duel') {
+    const stake = payload.stake;
+    state.balance -= stake;
+    const duel = { id: '#' + Math.random().toString(36).substr(2,5).toUpperCase(),
+                   creator_id: state.me.tg_id, stake, status: 'waiting' };
+    state.currentDuel = duel;
+    showScreen('screen-waiting');
+    document.getElementById('waiting-stake-display').textContent = fmt(stake);
+    renderLobby();
+    // бот "принимает" через 1.5–3 сек
+    setTimeout(() => {
+      const bot = BOTS[Math.floor(Math.random() * BOTS.length)];
+      showToast(`${bot.avatar} ${bot.username} принял вызов!`, 'green');
+      offlineStartGame(stake, bot, true);
+    }, 1500 + Math.random() * 1500);
+    return;
+  }
+  if (type === 'cancel_duel') {
+    state.balance += state.currentDuel?.stake || 0;
+    state.currentDuel = null;
+    renderLobby();
+    showScreen('screen-lobby');
+    return;
+  }
+  if (type === 'join_duel') {
+    const duel = state.duels.find(d => d.id === payload.duel_id);
+    if (!duel) return;
+    state.balance -= duel.stake;
+    state.duels = state.duels.filter(d => d.id !== duel.id);
+    const bot = duel._bot || BOTS[0];
+    setTimeout(() => offlineStartGame(duel.stake, bot, false), 400);
+    return;
+  }
+  if (type === 'pick_cup') {
+    offlinePickCup(payload.cup_index);
+    return;
+  }
+  if (type === 'get_lobby') {
+    renderLobby();
+    return;
+  }
+}
+
+// ── Оффлайн игра с ботом ──
+function offlineStartGame(stake, bot, youGoFirst) {
+  const nums = shuffleArr([1,2,3,4,5,6,7,8,9]);
+  gameState = {
+    duelId: 'offline', stake, nums,
+    myRole: youGoFirst ? 'creator' : 'joiner',
+    myId: state.me.tg_id,
+    creatorId: youGoFirst ? state.me.tg_id : bot.tg_id,
+    joinerId:  youGoFirst ? bot.tg_id : state.me.tg_id,
+    opponent: bot,
+    youPicks: [], oppPicks: [],
+    yourTurn: youGoFirst,
+    tiebreaker: false, tbYou: null, tbOpp: null,
+    done: false,
+    _offline: true,
+  };
+  document.getElementById('opp-name').textContent = bot.username;
+  document.getElementById('hud-opp-avatar').textContent = bot.avatar;
+  document.getElementById('hud-you-avatar').textContent = state.me.avatar || '😎';
+  showScreen('screen-game');
+  renderGame();
+  if (!youGoFirst) setTimeout(offlineBotPick, 900 + Math.random()*600);
+}
+
+function offlinePickCup(idx) {
+  const g = gameState;
+  if (!g.yourTurn || g.done) return;
+
+  if (g.tiebreaker) {
+    g.tbYou = idx;
+    g.yourTurn = false;
+    renderGame();
+    setTimeout(offlineBotPickTb, 800 + Math.random()*500);
+    return;
+  }
+
+  g.youPicks.push(idx);
+  g.yourTurn = false;
+  renderGame();
+
+  if (g.youPicks.length + g.oppPicks.length === 6) {
+    setTimeout(offlineCheckTie, 700);
+  } else {
+    setTimeout(offlineBotPick, 800 + Math.random()*500);
+  }
+}
+
+function offlineCheckTie() {
+  const g = gameState;
+  const sY = g.youPicks.reduce((s,i)=>s+g.nums[i],0);
+  const sO = g.oppPicks.reduce((s,i)=>s+g.nums[i],0);
+  if (sY === sO) {
+    g.tiebreaker = true; g.yourTurn = true;
+    showToast('🤝 Ничья! Тайбрейк — выберите ещё 1 стаканчик!', 'gold');
+    renderGame();
+  } else {
+    g.done = true; offlineShowResult();
+  }
+}
+
+function offlineBotPick() {
+  const g = gameState;
+  const picked = new Set([...g.youPicks, ...g.oppPicks]);
+  const avail  = [0,1,2,3,4,5,6,7,8].filter(i=>!picked.has(i));
+  if (!avail.length) return;
+  const choice = avail[Math.floor(Math.random()*avail.length)];
+  animateOpponentCup(choice, () => {
+    g.oppPicks.push(choice);
+    if (g.youPicks.length + g.oppPicks.length === 6) {
+      setTimeout(offlineCheckTie, 700);
+    } else {
+      g.yourTurn = true; renderGame();
+    }
+  });
+}
+
+function offlineBotPickTb() {
+  const g = gameState;
+  const picked = new Set([...g.youPicks, ...g.oppPicks, g.tbYou]);
+  const avail  = [0,1,2,3,4,5,6,7,8].filter(i=>!picked.has(i));
+  if (!avail.length) return;
+  const choice = avail[Math.floor(Math.random()*avail.length)];
+  animateOpponentCup(choice, () => {
+    g.tbOpp = choice; g.done = true;
+    renderGame();
+    setTimeout(offlineShowResult, 800);
+  });
+}
+
+function offlineShowResult() {
+  const g = gameState;
+  const youScore = g.youPicks.reduce((s,i)=>s+g.nums[i],0) + (g.tbYou!=null?g.nums[g.tbYou]:0);
+  const oppScore = g.oppPicks.reduce((s,i)=>s+g.nums[i],0) + (g.tbOpp!=null?g.nums[g.tbOpp]:0);
+  const totalPot = g.stake * 2;
+  const commission = Math.floor(totalPot * 0.05);
+  const prize = totalPot - commission;
+  const youWin = youScore > oppScore;
+  const tie    = youScore === oppScore;
+
+  state.games++;
+  if (youWin) { state.wins++; state.balance += prize; state.earned += prize - g.stake; }
+  else if (tie) { state.balance += g.stake; }
+  renderLobby();
+
+  showResultWS({
+    winner_id:  youWin ? state.me.tg_id : tie ? null : g.opponent.tg_id,
+    picks_a: g.myRole==='creator' ? g.youPicks : g.oppPicks,
+    picks_b: g.myRole==='creator' ? g.oppPicks : g.youPicks,
+    tb_a: g.myRole==='creator' ? g.tbYou : g.tbOpp,
+    tb_b: g.myRole==='creator' ? g.tbOpp : g.tbYou,
+    nums: g.nums, prize, commission, total_pot: totalPot,
+    balances: { [state.me.tg_id]: state.balance },
+  });
+}
+
+function shuffleArr(arr) {
+  const a = [...arr];
+  for (let i=a.length-1;i>0;i--) {
+    const j=Math.floor(Math.random()*(i+1));
+    [a[i],a[j]]=[a[j],a[i]];
+  }
+  return a;
 }
 
 // ════════════════════ MESSAGE HANDLER ════════════════════
@@ -1056,13 +1274,16 @@ function pickCup(i) {
     ...(g.tbYou != null ? [g.tbYou] : []),
     ...(g.tbOpp != null ? [g.tbOpp] : [])];
   if (allPicked.includes(i)) return;
-
   if (!g.tiebreaker && g.youPicks.length >= 3) return;
 
-  // оптимистично блокируем кнопки пока ждём ответ
+  if (offlineMode) {
+    wsSend('pick_cup', { cup_index: i });
+    return;
+  }
+
+  // онлайн — блокируем кнопки пока ждём ответ сервера
   g.yourTurn = false;
   renderGame();
-
   wsSend('pick_cup', { duel_id: g.duelId, cup_index: i });
 }
 
