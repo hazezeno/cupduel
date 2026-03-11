@@ -708,19 +708,22 @@ function wsConnect() {
     clearTimeout(timeout);
     wsReady = true;
     connectAttempts = 0;
-    const tg = window.Telegram?.WebApp?.initDataUnsafe?.user;
+
+    // Пробуем получить данные от Telegram WebApp
+    const tgWebApp = window.Telegram?.WebApp;
+    const tgUser = tgWebApp?.initDataUnsafe?.user;
+
     let me;
-    if (tg && tg.id) {
-      // Telegram передал данные — используем их и сохраняем
-      me = { tg_id: tg.id, username: tg.first_name || tg.username || 'Игрок', avatar: '🎮' };
-      try { localStorage.setItem('cupduel_uid', String(tg.id)); localStorage.setItem('cupduel_name', me.username); } catch {}
+    if (tgUser && tgUser.id) {
+      // Telegram передал настоящие данные
+      const name = tgUser.first_name || tgUser.username || 'Игрок';
+      me = { tg_id: tgUser.id, username: name, avatar: '🎮' };
+      try { localStorage.setItem('cupduel_uid', String(tgUser.id)); localStorage.setItem('cupduel_name', name); } catch {}
     } else {
-      // Нет данных от Telegram — берём сохранённый id или создаём один раз
-      let savedId = null;
-      try { savedId = localStorage.getItem('cupduel_uid'); } catch {}
+      // Telegram не передал данные — берём сохранённый ID
+      let savedId = null, savedName = 'Игрок';
+      try { savedId = localStorage.getItem('cupduel_uid'); savedName = localStorage.getItem('cupduel_name') || 'Игрок'; } catch {}
       if (savedId) {
-        let savedName = 'Игрок';
-        try { savedName = localStorage.getItem('cupduel_name') || 'Игрок'; } catch {}
         me = { tg_id: Number(savedId), username: savedName, avatar: '🎮' };
       } else {
         const newId = 100000 + Math.floor(Math.random()*900000);
@@ -730,7 +733,8 @@ function wsConnect() {
       }
     }
     state.me = me;
-    wsSend('auth', me);
+    // Сообщаем серверу — передаём также telegram_username для поиска
+    wsSend('auth', { ...me, tg_username: tgUser?.username || null });
   };
 
   ws.onmessage = (e) => {
