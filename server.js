@@ -219,6 +219,52 @@ async function handleTgUpdate(update) {
     return;
   }
 
+  // /setbalance — установить точный баланс
+  if (text.startsWith('/setbalance')) {
+    if (fromId !== ADMIN_ID) return;
+    const parts = text.trim().split(/\s+/);
+    if (parts.length < 3) {
+      await tgSend('sendMessage', { chat_id: chatId, text: '❌ Формат: /setbalance @username 1000' });
+      return;
+    }
+    const target = parts[1].replace('@', '').trim();
+    const amount = parseInt(parts[2]);
+    if (isNaN(amount) || amount < 0) {
+      await tgSend('sendMessage', { chat_id: chatId, text: '❌ Укажи корректную сумму.' });
+      return;
+    }
+    if (!pool) { await tgSend('sendMessage', { chat_id: chatId, text: '❌ БД недоступна.' }); return; }
+
+    let player = null;
+    if (/^\d+$/.test(target)) {
+      const r = await pool.query('SELECT * FROM players WHERE tg_id = $1', [Number(target)]);
+      player = r.rows[0] || null;
+    }
+    if (!player) {
+      const r = await pool.query('SELECT * FROM players WHERE LOWER(tg_username) = $1', [target.toLowerCase()]);
+      player = r.rows[0] || null;
+    }
+    if (!player) {
+      const r = await pool.query('SELECT * FROM players WHERE LOWER(username) = $1', [target.toLowerCase()]);
+      player = r.rows[0] || null;
+    }
+    if (!player) {
+      await tgSend('sendMessage', { chat_id: chatId, text: '❌ Игрок ' + target + ' не найден.' });
+      return;
+    }
+
+    const { rows } = await pool.query(
+      'UPDATE players SET balance = $1 WHERE tg_id = $2 RETURNING balance, username',
+      [amount, player.tg_id]
+    );
+    const playerWs = clients.get(player.tg_id);
+    if (playerWs && playerWs.readyState === 1) {
+      playerWs.send(JSON.stringify({ type: 'balance_update', payload: { balance: rows[0].balance, reason: '💰 Ваш баланс обновлён.' } }));
+    }
+    await tgSend('sendMessage', { chat_id: chatId, text: '✅ Баланс ' + rows[0].username + ' установлен: ' + rows[0].balance + ' монет.' });
+    return;
+  }
+
   // /players — топ игроков (только админ)
   if (text.startsWith('/players')) {
     if (fromId !== ADMIN_ID) return;
@@ -307,16 +353,20 @@ wss.on('connection', ws => {
     const {type,payload} = msg;
 
     if (type==='auth') {
-      myId = Number(payload.tg_id);
-      clients.set(myId, ws);
-      console.log('WS auth: tg_id=' + myId + ', username=' + payload.username + ', pool=' + !!pool);
+      const rawId = Number(payload.tg_id);
+      console.log('WS auth: tg_id=' + rawId + ', username=' + payload.username + ', pool=' + !!pool);
       try {
-        const player = await dbUpsert(myId, payload.username || ('Игрок_' + myId), payload.tg_username || null);
-        console.log('WS auth saved: tg_id=' + player.tg_id + ', balance=' + player.balance);
+        const player = await dbUpsert(rawId, payload.username || ('Игрок_' + rawId), payload.tg_username || null);
+        // Используем tg_id из БД (настоящий), а не случайный из клиента
+        myId = Number(player.tg_id);
+        clients.set(myId, ws);
+        console.log('WS auth ok: real_tg_id=' + myId + ', balance=' + player.balance);
         send(ws, {type:'authed', payload:{player, duels:waitingDuels()}});
       } catch(e) {
         console.error('WS auth DB error: ' + e.message);
-        send(ws, {type:'authed', payload:{player:{tg_id:myId,username:payload.username,balance:1000,wins:0,games:0,earned:0}, duels:waitingDuels()}});
+        myId = rawId;
+        clients.set(myId, ws);
+        send(ws, {type:'authed', payload:{player:{tg_id:rawId,username:payload.username,balance:1000,wins:0,games:0,earned:0}, duels:waitingDuels()}});
       }
       return;
     }
