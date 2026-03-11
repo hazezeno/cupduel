@@ -127,136 +127,137 @@ async function handleTgUpdate(update) {
   const msg = update?.message;
   if (!msg) return;
 
-  const text     = msg.text || '';
-  const fromId   = Number(msg.from?.id);
-  const chatId   = msg.chat.id;
+  const text   = msg.text || '';
+  const fromId = Number(msg.from?.id);
+  const chatId = msg.chat.id;
+  const name   = msg.from?.first_name || msg.from?.username || 'Игрок';
+  const tgUsername = msg.from?.username || null;
 
-  console.log(`TG update from ${fromId}, ADMIN_ID=${ADMIN_ID}, match=${fromId === ADMIN_ID}`);
+  console.log('TG from=' + fromId + ' ADMIN=' + ADMIN_ID + ' match=' + (fromId === ADMIN_ID));
 
-  // ── /givetokens @username сумма ──────────────────
+  // Авторегистрация при любом сообщении
+  if (pool && fromId) {
+    try {
+      await pool.query(
+        `INSERT INTO players (tg_id, username, tg_username)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (tg_id) DO UPDATE
+           SET username = EXCLUDED.username,
+               tg_username = COALESCE(EXCLUDED.tg_username, players.tg_username)`,
+        [fromId, name, tgUsername]
+      );
+    } catch(e) { console.error('autoreg error: ' + e.message); }
+  }
+
+  // /givetokens (@username или tg_id) сумма
   if (text.startsWith('/givetokens')) {
     if (fromId !== ADMIN_ID) {
-      await tgSend('sendMessage', { chat_id: chatId, text: '❌ У вас нет прав для этой команды.' });
+      await tgSend('sendMessage', { chat_id: chatId, text: '❌ Нет прав.' });
       return;
     }
-    // Парсим: /givetokens @ник 500  или  /givetokens ник 500
     const parts = text.trim().split(/\s+/);
     if (parts.length < 3) {
       await tgSend('sendMessage', { chat_id: chatId, text: '❌ Формат: /givetokens @username 500' });
       return;
     }
-    const rawTarget = parts[1].replace('@', '');
-    const amount    = parseInt(parts[2]);
+    const target = parts[1].replace('@', '').trim();
+    const amount = parseInt(parts[2]);
     if (!amount || amount <= 0) {
-      await tgSend('sendMessage', { chat_id: chatId, text: '❌ Укажи правильную сумму.' });
+      await tgSend('sendMessage', { chat_id: chatId, text: '❌ Укажи корректную сумму.' });
       return;
     }
     if (!pool) {
-      await tgSend('sendMessage', { chat_id: chatId, text: '❌ База данных недоступна.' });
+      await tgSend('sendMessage', { chat_id: chatId, text: '❌ БД недоступна.' });
       return;
     }
-    // Ищем по ID (если число) или по tg_username / display name
-    const isId = /^\d+$/.test(rawTarget);
-    let queryRows;
-    if (isId) {
-      const r = await pool.query('SELECT * FROM players WHERE tg_id = $1', [Number(rawTarget)]);
-      queryRows = r.rows;
-    } else {
-      // Сначала ищем по Telegram username, потом по display name
-      const r1 = await pool.query('SELECT * FROM players WHERE LOWER(tg_username) = $1', [rawTarget.toLowerCase()]);
-      if (r1.rows.length) {
-        queryRows = r1.rows;
-      } else {
-        const r2 = await pool.query('SELECT * FROM players WHERE LOWER(username) = $1', [rawTarget.toLowerCase()]);
-        queryRows = r2.rows;
-      }
+
+    // Ищем игрока: сначала по tg_id, потом по @username (tg_username), потом по display name
+    let player = null;
+    if (/^\d+$/.test(target)) {
+      const r = await pool.query('SELECT * FROM players WHERE tg_id = $1', [Number(target)]);
+      player = r.rows[0] || null;
     }
-    const rows = queryRows;
-    if (!rows.length) {
+    if (!player) {
+      const r = await pool.query('SELECT * FROM players WHERE LOWER(tg_username) = $1', [target.toLowerCase()]);
+      player = r.rows[0] || null;
+    }
+    if (!player) {
+      const r = await pool.query('SELECT * FROM players WHERE LOWER(username) = $1', [target.toLowerCase()]);
+      player = r.rows[0] || null;
+    }
+
+    if (!player) {
       await tgSend('sendMessage', {
         chat_id: chatId,
-        parse_mode: 'Markdown',
-        text: `❌ Игрок *${rawTarget}* не найден.\nОн должен хотя бы раз зайти в игру.`,
+        text: '❌ Игрок ' + target + ' не найден. Он должен написать боту /start чтобы зарегистрироваться.',
       });
       return;
     }
-    const player = rows[0];
-    const newBal = await dbAddBalance(player.tg_id, amount);
+
+    // Добавляем баланс прямо в БД
+    const { rows } = await pool.query(
+      'UPDATE players SET balance = balance + $1 WHERE tg_id = $2 RETURNING balance, username',
+      [amount, player.tg_id]
+    );
+    const newBalance = rows[0].balance;
+    const playerName = rows[0].username;
+
     // Уведомляем админа
     await tgSend('sendMessage', {
       chat_id: chatId,
-      parse_mode: 'Markdown',
-      text: `✅ Выдано *${amount}* монет игроку *${player.username}*\nНовый баланс: *${newBal}* монет`,
+      text: '✅ ' + playerName + ' получил ' + amount + ' монет. Новый баланс: ' + newBalance,
     });
-    // Уведомляем игрока если он онлайн в WS
+
+    // Если игрок онлайн — обновляем баланс в реальном времени
     const playerWs = clients.get(player.tg_id);
-    if (playerWs) {
+    if (playerWs && playerWs.readyState === 1) {
       playerWs.send(JSON.stringify({
         type: 'balance_update',
-        payload: { balance: newBal, reason: `🎁 Администратор выдал вам ${amount} монет!` }
+        payload: { balance: newBalance, reason: '🎁 Вам выдали ' + amount + ' монет!' }
       }));
     }
     return;
   }
 
-  // ── /addme — принудительно добавить себя в БД ──
+  // /players — топ игроков (только админ)
+  if (text.startsWith('/players')) {
+    if (fromId !== ADMIN_ID) return;
+    if (!pool) { await tgSend('sendMessage', { chat_id: chatId, text: '❌ БД недоступна.' }); return; }
+    const { rows } = await pool.query(
+      'SELECT tg_id, username, tg_username, balance, wins, games FROM players ORDER BY balance DESC LIMIT 20'
+    );
+    if (!rows.length) { await tgSend('sendMessage', { chat_id: chatId, text: 'Нет игроков.' }); return; }
+    const list = rows.map((p, i) => {
+      const un = p.tg_username ? ' (@' + p.tg_username + ')' : '';
+      return (i+1) + '. ' + p.username + un + ' — ' + p.balance + ' монет (побед: ' + p.wins + '/' + p.games + ')';
+    }).join('\n');
+    await tgSend('sendMessage', { chat_id: chatId, text: '👥 Топ игроков:\n\n' + list });
+    return;
+  }
+
+  // /addme — принудительная регистрация
   if (text.startsWith('/addme')) {
     if (!pool) { await tgSend('sendMessage', { chat_id: chatId, text: '❌ БД недоступна.' }); return; }
-    const name = msg.from?.first_name || msg.from?.username || 'Игрок';
-    const { rows } = await pool.query(
-      `INSERT INTO players (tg_id, username) VALUES ($1, $2)
-       ON CONFLICT (tg_id) DO UPDATE SET username = EXCLUDED.username
-       RETURNING *`,
-      [fromId, name]
-    );
+    const { rows } = await pool.query('SELECT * FROM players WHERE tg_id = $1', [fromId]);
     const p = rows[0];
     await tgSend('sendMessage', {
       chat_id: chatId,
-      parse_mode: 'Markdown',
-      text: `✅ Ты добавлен в базу!
-
-*ID:* \`${p.tg_id}\`
-*Имя:* ${p.username}
-*Баланс:* ${p.balance} монет`,
+      text: '✅ Зарегистрирован!\nID: ' + fromId + '\nИмя: ' + p.username + '\nБаланс: ' + p.balance + ' монет',
     });
     return;
   }
 
-  // ── /players — список игроков (только для админа) ──
-  if (text.startsWith('/players')) {
-    if (fromId !== ADMIN_ID) return;
-    if (!pool) { await tgSend('sendMessage', { chat_id: chatId, text: '❌ БД недоступна.' }); return; }
-    const { rows } = await pool.query('SELECT username, balance, wins, games FROM players ORDER BY balance DESC LIMIT 20');
-    if (!rows.length) { await tgSend('sendMessage', { chat_id: chatId, text: 'Нет игроков.' }); return; }
-    const list = rows.map((p,i) => `${i+1}. *${p.username}* — ${p.balance} монет (побед: ${p.wins}/${p.games})`).join('\n');
-    await tgSend('sendMessage', { chat_id: chatId, parse_mode: 'Markdown', text: `👥 *Топ игроков:*\n\n${list}` });
-    return;
-  }
-
-  // ── Обычное приветствие + авторегистрация ───────────────────────────
-  // Регистрируем игрока в БД при любом сообщении боту
-  if (pool && fromId) {
-    const name = msg.from?.first_name || msg.from?.username || 'Игрок';
-    try {
-      await pool.query(
-        `INSERT INTO players (tg_id, username) VALUES ($1, $2)
-         ON CONFLICT (tg_id) DO UPDATE SET username = EXCLUDED.username`,
-        [fromId, name]
-      );
-      console.log('Auto-registered: ' + fromId + ' (' + name + ')');
-    } catch(e) {
-      console.error('Auto-register error: ' + e.message);
-    }
-  }
-  tgSend('sendMessage', {
+  // Приветствие
+  await tgSend('sendMessage', {
     chat_id: chatId,
     parse_mode: 'Markdown',
-    text: `👋 Привет, ${msg.from?.first_name || 'Игрок'}!\n\n🥤 *CupDuel* — игра в стаканчики!\n\nВыбирай 3 стаканчика из 9, у кого сумма больше — забирает *95%* банка!`,
+    text: '👋 Привет, ' + name + '!\n\n🥤 *CupDuel* — игра в стаканчики!\n\nВыбирай 3 стаканчика из 9, у кого сумма больше — забирает *95%* банка!',
     reply_markup: TG_APP_URL ? {
       inline_keyboard: [[{ text: '🎮 Играть', web_app: { url: TG_APP_URL } }]]
     } : undefined,
   });
 }
+
 
 // ─────────────────────────────────────────────
 // IN-MEMORY (активные дуэли)
