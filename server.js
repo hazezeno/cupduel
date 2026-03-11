@@ -125,8 +125,10 @@ async function handleTgUpdate(update) {
   if (!msg) return;
 
   const text     = msg.text || '';
-  const fromId   = msg.from?.id;
+  const fromId   = Number(msg.from?.id);
   const chatId   = msg.chat.id;
+
+  console.log(`TG update from ${fromId}, ADMIN_ID=${ADMIN_ID}, match=${fromId === ADMIN_ID}`);
 
   // ── /givetokens @username сумма ──────────────────
   if (text.startsWith('/givetokens')) {
