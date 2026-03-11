@@ -525,7 +525,7 @@
 <div class="screen" id="screen-lobby">
   <div class="header">
     <div class="logo">CupDuel</div>
-    <div class="balance-chip">
+    <div class="balance-chip" ondblclick="if(confirm('Сбросить кэш и перезайти?')) { localStorage.clear(); location.reload(); }">
       <span>💰</span>
       <span id="balance-display">1 000</span>
       <span>монет</span>
@@ -667,6 +667,7 @@
       Задеплой <b>server.js</b> на Railway и открой через Telegram Mini App.
     </div>
     <button class="play-again-btn" style="max-width:240px;margin-top:10px" onclick="wsReconnect()">🔄 Переподключиться</button>
+    <button onclick="resetAndReload()" style="margin-top:12px;background:none;border:none;color:#888;font-size:12px;text-decoration:underline;cursor:pointer;">Сбросить данные и переподключиться</button>
   </div>
 </div>
 
@@ -752,6 +753,11 @@ function wsConnect() {
   };
 
   ws.onerror = () => { clearTimeout(timeout); };
+}
+
+function resetAndReload() {
+  try { localStorage.clear(); } catch {}
+  location.reload();
 }
 
 function wsReconnect() {
