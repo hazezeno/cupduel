@@ -895,6 +895,12 @@ function handleMessage({ type, payload }) {
       state.duels = payload.duels;
       renderLobby();
       break;
+
+    case 'balance_update':
+      state.balance = payload.balance;
+      renderLobby();
+      showToast(payload.reason || '💰 Баланс обновлён', 'green');
+      break;
   }
 }
 
