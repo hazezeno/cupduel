@@ -33,14 +33,17 @@ async function dbInit() {
     });
     await pool.query(`
       CREATE TABLE IF NOT EXISTS players (
-        tg_id    BIGINT PRIMARY KEY,
-        username TEXT    NOT NULL DEFAULT 'Игрок',
-        balance  INTEGER NOT NULL DEFAULT 1000,
-        wins     INTEGER NOT NULL DEFAULT 0,
-        games    INTEGER NOT NULL DEFAULT 0,
-        earned   INTEGER NOT NULL DEFAULT 0
+        tg_id       BIGINT PRIMARY KEY,
+        username    TEXT    NOT NULL DEFAULT 'Игрок',
+        tg_username TEXT,
+        balance     INTEGER NOT NULL DEFAULT 1000,
+        wins        INTEGER NOT NULL DEFAULT 0,
+        games       INTEGER NOT NULL DEFAULT 0,
+        earned      INTEGER NOT NULL DEFAULT 0
       )
     `);
+    // Добавить колонку если её нет (для существующих БД)
+    await pool.query('ALTER TABLE players ADD COLUMN IF NOT EXISTS tg_username TEXT').catch(()=>{});
     console.log('✅ PostgreSQL подключён');
   } catch (e) {
     console.error('❌ PostgreSQL ошибка:', e.message);
@@ -48,13 +51,13 @@ async function dbInit() {
   }
 }
 
-async function dbUpsert(tg_id, username) {
+async function dbUpsert(tg_id, username, tg_username) {
   if (pool) {
     const { rows } = await pool.query(
-      `INSERT INTO players (tg_id, username) VALUES ($1, $2)
-       ON CONFLICT (tg_id) DO UPDATE SET username = EXCLUDED.username
+      `INSERT INTO players (tg_id, username, tg_username) VALUES ($1, $2, $3)
+       ON CONFLICT (tg_id) DO UPDATE SET username = EXCLUDED.username, tg_username = COALESCE(EXCLUDED.tg_username, players.tg_username)
        RETURNING *`,
-      [tg_id, username]
+      [tg_id, username, tg_username || null]
     );
     return rows[0];
   }
@@ -152,11 +155,23 @@ async function handleTgUpdate(update) {
       await tgSend('sendMessage', { chat_id: chatId, text: '❌ База данных недоступна.' });
       return;
     }
-    // Ищем по ID (если число) или по username
+    // Ищем по ID (если число) или по tg_username / display name
     const isId = /^\d+$/.test(rawTarget);
-    const { rows } = isId
-      ? await pool.query('SELECT * FROM players WHERE tg_id = $1', [Number(rawTarget)])
-      : await pool.query('SELECT * FROM players WHERE LOWER(username) = $1', [rawTarget.toLowerCase()]);
+    let queryRows;
+    if (isId) {
+      const r = await pool.query('SELECT * FROM players WHERE tg_id = $1', [Number(rawTarget)]);
+      queryRows = r.rows;
+    } else {
+      // Сначала ищем по Telegram username, потом по display name
+      const r1 = await pool.query('SELECT * FROM players WHERE LOWER(tg_username) = $1', [rawTarget.toLowerCase()]);
+      if (r1.rows.length) {
+        queryRows = r1.rows;
+      } else {
+        const r2 = await pool.query('SELECT * FROM players WHERE LOWER(username) = $1', [rawTarget.toLowerCase()]);
+        queryRows = r2.rows;
+      }
+    }
+    const rows = queryRows;
     if (!rows.length) {
       await tgSend('sendMessage', {
         chat_id: chatId,
@@ -218,7 +233,21 @@ async function handleTgUpdate(update) {
     return;
   }
 
-  // ── Обычное приветствие ───────────────────────────
+  // ── Обычное приветствие + авторегистрация ───────────────────────────
+  // Регистрируем игрока в БД при любом сообщении боту
+  if (pool && fromId) {
+    const name = msg.from?.first_name || msg.from?.username || 'Игрок';
+    try {
+      await pool.query(
+        `INSERT INTO players (tg_id, username) VALUES ($1, $2)
+         ON CONFLICT (tg_id) DO UPDATE SET username = EXCLUDED.username`,
+        [fromId, name]
+      );
+      console.log('Auto-registered: ' + fromId + ' (' + name + ')');
+    } catch(e) {
+      console.error('Auto-register error: ' + e.message);
+    }
+  }
   tgSend('sendMessage', {
     chat_id: chatId,
     parse_mode: 'Markdown',
@@ -281,7 +310,7 @@ wss.on('connection', ws => {
       clients.set(myId, ws);
       console.log('WS auth: tg_id=' + myId + ', username=' + payload.username + ', pool=' + !!pool);
       try {
-        const player = await dbUpsert(myId, payload.username || ('Игрок_' + myId));
+        const player = await dbUpsert(myId, payload.username || ('Игрок_' + myId), payload.tg_username || null);
         console.log('WS auth saved: tg_id=' + player.tg_id + ', balance=' + player.balance);
         send(ws, {type:'authed', payload:{player, duels:waitingDuels()}});
       } catch(e) {
