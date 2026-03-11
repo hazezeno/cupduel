@@ -125,8 +125,10 @@ async function handleTgUpdate(update) {
   if (!msg) return;
 
   const text     = msg.text || '';
-  const fromId   = msg.from?.id;
+  const fromId   = Number(msg.from?.id);
   const chatId   = msg.chat.id;
+
+  console.log(`TG update from ${fromId}, ADMIN_ID=${ADMIN_ID}, match=${fromId === ADMIN_ID}`);
 
   // ── /givetokens @username сумма ──────────────────
   if (text.startsWith('/givetokens')) {
@@ -179,6 +181,29 @@ async function handleTgUpdate(update) {
         payload: { balance: newBal, reason: `🎁 Администратор выдал вам ${amount} монет!` }
       }));
     }
+    return;
+  }
+
+  // ── /addme — принудительно добавить себя в БД ──
+  if (text.startsWith('/addme')) {
+    if (!pool) { await tgSend('sendMessage', { chat_id: chatId, text: '❌ БД недоступна.' }); return; }
+    const name = msg.from?.first_name || msg.from?.username || 'Игрок';
+    const { rows } = await pool.query(
+      `INSERT INTO players (tg_id, username) VALUES ($1, $2)
+       ON CONFLICT (tg_id) DO UPDATE SET username = EXCLUDED.username
+       RETURNING *`,
+      [fromId, name]
+    );
+    const p = rows[0];
+    await tgSend('sendMessage', {
+      chat_id: chatId,
+      parse_mode: 'Markdown',
+      text: `✅ Ты добавлен в базу!
+
+*ID:* \`${p.tg_id}\`
+*Имя:* ${p.username}
+*Баланс:* ${p.balance} монет`,
+    });
     return;
   }
 
@@ -254,8 +279,15 @@ wss.on('connection', ws => {
     if (type==='auth') {
       myId = Number(payload.tg_id);
       clients.set(myId, ws);
-      const player = await dbUpsert(myId, payload.username||`Игрок_${myId}`);
-      send(ws, {type:'authed', payload:{player, duels:waitingDuels()}});
+      console.log('WS auth: tg_id=' + myId + ', username=' + payload.username + ', pool=' + !!pool);
+      try {
+        const player = await dbUpsert(myId, payload.username || ('Игрок_' + myId));
+        console.log('WS auth saved: tg_id=' + player.tg_id + ', balance=' + player.balance);
+        send(ws, {type:'authed', payload:{player, duels:waitingDuels()}});
+      } catch(e) {
+        console.error('WS auth DB error: ' + e.message);
+        send(ws, {type:'authed', payload:{player:{tg_id:myId,username:payload.username,balance:1000,wins:0,games:0,earned:0}, duels:waitingDuels()}});
+      }
       return;
     }
     if (!myId) return;
