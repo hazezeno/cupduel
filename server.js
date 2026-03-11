@@ -12,6 +12,7 @@ const PORT       = process.env.PORT || 3000;
 const COMMISSION = 0.05;
 const TG_TOKEN   = process.env.TG_TOKEN   || '';
 const TG_APP_URL = process.env.TG_APP_URL || '';
+const ADMIN_ID   = Number(process.env.ADMIN_ID) || 0; // твой Telegram ID
 
 // ─────────────────────────────────────────────
 // DATABASE — PostgreSQL или память
@@ -119,11 +120,82 @@ async function tgSetWebhook() {
   console.log('✅ Telegram webhook set');
 }
 
-function handleTgUpdate(update) {
+async function handleTgUpdate(update) {
   const msg = update?.message;
   if (!msg) return;
+
+  const text     = msg.text || '';
+  const fromId   = msg.from?.id;
+  const chatId   = msg.chat.id;
+
+  // ── /givetokens @username сумма ──────────────────
+  if (text.startsWith('/givetokens')) {
+    if (fromId !== ADMIN_ID) {
+      await tgSend('sendMessage', { chat_id: chatId, text: '❌ У вас нет прав для этой команды.' });
+      return;
+    }
+    // Парсим: /givetokens @ник 500  или  /givetokens ник 500
+    const parts = text.trim().split(/\s+/);
+    if (parts.length < 3) {
+      await tgSend('sendMessage', { chat_id: chatId, text: '❌ Формат: /givetokens @username 500' });
+      return;
+    }
+    const rawTarget = parts[1].replace('@', '');
+    const amount    = parseInt(parts[2]);
+    if (!amount || amount <= 0) {
+      await tgSend('sendMessage', { chat_id: chatId, text: '❌ Укажи правильную сумму.' });
+      return;
+    }
+    if (!pool) {
+      await tgSend('sendMessage', { chat_id: chatId, text: '❌ База данных недоступна.' });
+      return;
+    }
+    // Ищем по ID (если число) или по username
+    const isId = /^\d+$/.test(rawTarget);
+    const { rows } = isId
+      ? await pool.query('SELECT * FROM players WHERE tg_id = $1', [Number(rawTarget)])
+      : await pool.query('SELECT * FROM players WHERE LOWER(username) = $1', [rawTarget.toLowerCase()]);
+    if (!rows.length) {
+      await tgSend('sendMessage', {
+        chat_id: chatId,
+        parse_mode: 'Markdown',
+        text: `❌ Игрок *${rawTarget}* не найден.\nОн должен хотя бы раз зайти в игру.`,
+      });
+      return;
+    }
+    const player = rows[0];
+    const newBal = await dbAddBalance(player.tg_id, amount);
+    // Уведомляем админа
+    await tgSend('sendMessage', {
+      chat_id: chatId,
+      parse_mode: 'Markdown',
+      text: `✅ Выдано *${amount}* монет игроку *${player.username}*\nНовый баланс: *${newBal}* монет`,
+    });
+    // Уведомляем игрока если он онлайн в WS
+    const playerWs = clients.get(player.tg_id);
+    if (playerWs) {
+      playerWs.send(JSON.stringify({
+        type: 'balance_update',
+        payload: { balance: newBal, reason: `🎁 Администратор выдал вам ${amount} монет!` }
+      }));
+    }
+    return;
+  }
+
+  // ── /players — список игроков (только для админа) ──
+  if (text.startsWith('/players')) {
+    if (fromId !== ADMIN_ID) return;
+    if (!pool) { await tgSend('sendMessage', { chat_id: chatId, text: '❌ БД недоступна.' }); return; }
+    const { rows } = await pool.query('SELECT username, balance, wins, games FROM players ORDER BY balance DESC LIMIT 20');
+    if (!rows.length) { await tgSend('sendMessage', { chat_id: chatId, text: 'Нет игроков.' }); return; }
+    const list = rows.map((p,i) => `${i+1}. *${p.username}* — ${p.balance} монет (побед: ${p.wins}/${p.games})`).join('\n');
+    await tgSend('sendMessage', { chat_id: chatId, parse_mode: 'Markdown', text: `👥 *Топ игроков:*\n\n${list}` });
+    return;
+  }
+
+  // ── Обычное приветствие ───────────────────────────
   tgSend('sendMessage', {
-    chat_id: msg.chat.id,
+    chat_id: chatId,
     parse_mode: 'Markdown',
     text: `👋 Привет, ${msg.from?.first_name || 'Игрок'}!\n\n🥤 *CupDuel* — игра в стаканчики!\n\nВыбирай 3 стаканчика из 9, у кого сумма больше — забирает *95%* банка!`,
     reply_markup: TG_APP_URL ? {
