@@ -709,9 +709,26 @@ function wsConnect() {
     wsReady = true;
     connectAttempts = 0;
     const tg = window.Telegram?.WebApp?.initDataUnsafe?.user;
-    const me = tg
-      ? { tg_id: tg.id, username: tg.first_name || tg.username || 'Игрок', avatar: '🎮' }
-      : { tg_id: 100000 + Math.floor(Math.random()*900000), username: 'Игрок_' + Math.floor(Math.random()*9999), avatar: '🎮' };
+    let me;
+    if (tg && tg.id) {
+      // Telegram передал данные — используем их и сохраняем
+      me = { tg_id: tg.id, username: tg.first_name || tg.username || 'Игрок', avatar: '🎮' };
+      try { localStorage.setItem('cupduel_uid', String(tg.id)); localStorage.setItem('cupduel_name', me.username); } catch {}
+    } else {
+      // Нет данных от Telegram — берём сохранённый id или создаём один раз
+      let savedId = null;
+      try { savedId = localStorage.getItem('cupduel_uid'); } catch {}
+      if (savedId) {
+        let savedName = 'Игрок';
+        try { savedName = localStorage.getItem('cupduel_name') || 'Игрок'; } catch {}
+        me = { tg_id: Number(savedId), username: savedName, avatar: '🎮' };
+      } else {
+        const newId = 100000 + Math.floor(Math.random()*900000);
+        const newName = 'Игрок_' + Math.floor(Math.random()*9999);
+        me = { tg_id: newId, username: newName, avatar: '🎮' };
+        try { localStorage.setItem('cupduel_uid', String(newId)); localStorage.setItem('cupduel_name', newName); } catch {}
+      }
+    }
     state.me = me;
     wsSend('auth', me);
   };
