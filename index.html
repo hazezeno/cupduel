@@ -521,7 +521,7 @@
 <div class="toast" id="toast"></div>
 
 <!-- ════════════════════ LOBBY SCREEN ════════════════════ -->
-<div class="screen active" id="screen-lobby">
+<div class="screen" id="screen-lobby">
   <div class="header">
     <div class="logo">CupDuel</div>
     <div class="balance-chip">
@@ -647,18 +647,35 @@
   </div>
 </div>
 
+<!-- ════════════════════ CONNECTING SCREEN ════════════════════ -->
+<div class="screen" id="screen-connecting">
+  <div class="waiting-body">
+    <div class="spinner"></div>
+    <div class="waiting-title">Подключение...</div>
+    <div class="waiting-sub" id="connecting-status">Соединение с сервером</div>
+  </div>
+</div>
+
+<!-- ════════════════════ NO SERVER SCREEN ════════════════════ -->
+<div class="screen" id="screen-noserver">
+  <div class="waiting-body">
+    <div style="font-size:64px;margin-bottom:20px;">🔌</div>
+    <div class="waiting-title" style="color:var(--red)">Нет сервера</div>
+    <div class="waiting-sub" style="margin-bottom:30px;max-width:280px;text-align:center;line-height:1.7">
+      Игра требует подключения к серверу.<br>
+      Задеплой <b>server.js</b> на Railway и открой через Telegram Mini App.
+    </div>
+    <button class="play-again-btn" style="max-width:240px;margin-top:10px" onclick="wsReconnect()">🔄 Переподключиться</button>
+  </div>
+</div>
+
 <script>
 // ════════════════════ STATE ════════════════════
 let state = {
-  balance: 0,
-  wins: 0,
-  games: 0,
-  earned: 0,
-  duels: [],       // lobby duels list
-  currentDuel: null,
-  currentStake: 100,
-  me: null,        // { tg_id, username, avatar }
+  balance: 0, wins: 0, games: 0, earned: 0,
+  duels: [], currentDuel: null, me: null,
 };
+let gameState = {};
 
 // ════════════════════ WEBSOCKET ════════════════════
 const WS_URL = location.protocol === 'https:'
@@ -667,258 +684,87 @@ const WS_URL = location.protocol === 'https:'
 
 let ws = null;
 let wsReady = false;
-let offlineMode = false; // режим без сервера — играем с ботами
-
-const BOTS = [
-  {tg_id:-1, username:'Максим К.', avatar:'🦊'},
-  {tg_id:-2, username:'Анна Т.',   avatar:'🦅'},
-  {tg_id:-3, username:'Дмитрий В.',avatar:'🐉'},
-  {tg_id:-4, username:'Алина С.',  avatar:'🌙'},
-  {tg_id:-5, username:'Алексей Р.',avatar:'⚡'},
-];
+let reconnectTimer = null;
+let connectAttempts = 0;
 
 function wsConnect() {
-  // Если открыто как файл (file://) или как артефакт — сразу оффлайн режим
-  if (location.protocol === 'file:' || location.hostname === 'claude.site'
-      || location.hostname.includes('claude') || location.hostname === '') {
-    startOfflineMode();
-    return;
-  }
+  clearTimeout(reconnectTimer);
+  showScreen('screen-connecting');
+  document.getElementById('connecting-status').textContent = 'Соединение с сервером...';
+
+  try { ws?.close(); } catch {}
 
   try {
     ws = new WebSocket(WS_URL);
   } catch(e) {
-    startOfflineMode();
-    return;
+    showNoServer(); return;
   }
 
-  // Если за 3 секунды не подключился — уходим в оффлайн
   const timeout = setTimeout(() => {
-    if (!wsReady) { ws?.close(); startOfflineMode(); }
-  }, 3000);
+    if (!wsReady) { ws?.close(); showNoServer(); }
+  }, 5000);
 
   ws.onopen = () => {
     clearTimeout(timeout);
     wsReady = true;
-    const tg = window.Telegram?.WebApp?.initDataUnsafe?.user;
-    const me = tg
-      ? { tg_id: tg.id, username: tg.first_name || tg.username, avatar: '🎮' }
-      : { tg_id: 100000 + Math.floor(Math.random() * 900000), username: 'Игрок_' + Math.floor(Math.random()*9999), avatar: '🎮' };
+    connectAttempts = 0;
+
+    // Пробуем получить данные от Telegram WebApp
+    const tgWebApp = window.Telegram?.WebApp;
+    const tgUser = tgWebApp?.initDataUnsafe?.user;
+
+    let me;
+    if (tgUser && tgUser.id) {
+      // Telegram передал настоящие данные
+      const name = tgUser.first_name || tgUser.username || 'Игрок';
+      me = { tg_id: tgUser.id, username: name, avatar: '🎮' };
+      try { localStorage.setItem('cupduel_uid', String(tgUser.id)); localStorage.setItem('cupduel_name', name); } catch {}
+    } else {
+      // Telegram не передал данные — берём сохранённый ID
+      let savedId = null, savedName = 'Игрок';
+      try { savedId = localStorage.getItem('cupduel_uid'); savedName = localStorage.getItem('cupduel_name') || 'Игрок'; } catch {}
+      if (savedId) {
+        me = { tg_id: Number(savedId), username: savedName, avatar: '🎮' };
+      } else {
+        const newId = 100000 + Math.floor(Math.random()*900000);
+        const newName = 'Игрок_' + Math.floor(Math.random()*9999);
+        me = { tg_id: newId, username: newName, avatar: '🎮' };
+        try { localStorage.setItem('cupduel_uid', String(newId)); localStorage.setItem('cupduel_name', newName); } catch {}
+      }
+    }
     state.me = me;
-    wsSend('auth', me);
+    // Сообщаем серверу — передаём также telegram_username для поиска
+    wsSend('auth', { ...me, tg_username: tgUser?.username || null });
   };
 
   ws.onmessage = (e) => {
-    let msg;
-    try { msg = JSON.parse(e.data); } catch { return; }
+    let msg; try { msg = JSON.parse(e.data); } catch { return; }
     handleMessage(msg);
   };
 
   ws.onclose = () => {
     clearTimeout(timeout);
-    if (!wsReady && !offlineMode) { startOfflineMode(); return; }
     wsReady = false;
-    if (!offlineMode) {
-      showToast('⚠️ Соединение потеряно. Переподключение...', '');
-      setTimeout(wsConnect, 3000);
-    }
+    if (connectAttempts === 0) { showNoServer(); return; }
+    showToast('⚠️ Соединение потеряно. Переподключение...');
+    reconnectTimer = setTimeout(wsReconnect, 3000);
   };
 
-  ws.onerror = () => { clearTimeout(timeout); ws.close(); };
+  ws.onerror = () => { clearTimeout(timeout); };
 }
 
-// ════════════════════ OFFLINE MODE (с ботами) ════════════════════
-function startOfflineMode() {
-  offlineMode = true;
-  state.me = { tg_id: 1, username: 'Вы', avatar: '😎' };
-  state.balance = 1000;
-  // генерируем несколько дуэлей от ботов
-  const stakes = [50, 100, 200, 500];
-  state.duels = BOTS.slice(0,3).map((bot, i) => ({
-    id: '#BOT' + (i+1),
-    creator_id: bot.tg_id,
-    stake: stakes[i % stakes.length],
-    status: 'waiting',
-    _bot: bot,
-  }));
-  renderLobby();
-  showScreen('screen-lobby');
+function wsReconnect() {
+  connectAttempts++;
+  wsConnect();
+}
+
+function showNoServer() {
+  showScreen('screen-noserver');
 }
 
 function wsSend(type, payload) {
-  if (offlineMode) { handleOffline(type, payload); return; }
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (ws?.readyState === WebSocket.OPEN)
     ws.send(JSON.stringify({ type, payload }));
-  }
-}
-
-// ── Оффлайн обработчик (имитирует сервер) ──
-function handleOffline(type, payload) {
-  if (type === 'create_duel') {
-    const stake = payload.stake;
-    state.balance -= stake;
-    const duel = { id: '#' + Math.random().toString(36).substr(2,5).toUpperCase(),
-                   creator_id: state.me.tg_id, stake, status: 'waiting' };
-    state.currentDuel = duel;
-    showScreen('screen-waiting');
-    document.getElementById('waiting-stake-display').textContent = fmt(stake);
-    renderLobby();
-    // бот "принимает" через 1.5–3 сек
-    setTimeout(() => {
-      const bot = BOTS[Math.floor(Math.random() * BOTS.length)];
-      showToast(`${bot.avatar} ${bot.username} принял вызов!`, 'green');
-      offlineStartGame(stake, bot, true);
-    }, 1500 + Math.random() * 1500);
-    return;
-  }
-  if (type === 'cancel_duel') {
-    state.balance += state.currentDuel?.stake || 0;
-    state.currentDuel = null;
-    renderLobby();
-    showScreen('screen-lobby');
-    return;
-  }
-  if (type === 'join_duel') {
-    const duel = state.duels.find(d => d.id === payload.duel_id);
-    if (!duel) return;
-    state.balance -= duel.stake;
-    state.duels = state.duels.filter(d => d.id !== duel.id);
-    const bot = duel._bot || BOTS[0];
-    setTimeout(() => offlineStartGame(duel.stake, bot, false), 400);
-    return;
-  }
-  if (type === 'pick_cup') {
-    offlinePickCup(payload.cup_index);
-    return;
-  }
-  if (type === 'get_lobby') {
-    renderLobby();
-    return;
-  }
-}
-
-// ── Оффлайн игра с ботом ──
-function offlineStartGame(stake, bot, youGoFirst) {
-  const nums = shuffleArr([1,2,3,4,5,6,7,8,9]);
-  gameState = {
-    duelId: 'offline', stake, nums,
-    myRole: youGoFirst ? 'creator' : 'joiner',
-    myId: state.me.tg_id,
-    creatorId: youGoFirst ? state.me.tg_id : bot.tg_id,
-    joinerId:  youGoFirst ? bot.tg_id : state.me.tg_id,
-    opponent: bot,
-    youPicks: [], oppPicks: [],
-    yourTurn: youGoFirst,
-    tiebreaker: false, tbYou: null, tbOpp: null,
-    done: false,
-    _offline: true,
-  };
-  document.getElementById('opp-name').textContent = bot.username;
-  document.getElementById('hud-opp-avatar').textContent = bot.avatar;
-  document.getElementById('hud-you-avatar').textContent = state.me.avatar || '😎';
-  showScreen('screen-game');
-  renderGame();
-  if (!youGoFirst) setTimeout(offlineBotPick, 900 + Math.random()*600);
-}
-
-function offlinePickCup(idx) {
-  const g = gameState;
-  if (!g.yourTurn || g.done) return;
-
-  if (g.tiebreaker) {
-    g.tbYou = idx;
-    g.yourTurn = false;
-    renderGame();
-    setTimeout(offlineBotPickTb, 800 + Math.random()*500);
-    return;
-  }
-
-  g.youPicks.push(idx);
-  g.yourTurn = false;
-  renderGame();
-
-  if (g.youPicks.length + g.oppPicks.length === 6) {
-    setTimeout(offlineCheckTie, 700);
-  } else {
-    setTimeout(offlineBotPick, 800 + Math.random()*500);
-  }
-}
-
-function offlineCheckTie() {
-  const g = gameState;
-  const sY = g.youPicks.reduce((s,i)=>s+g.nums[i],0);
-  const sO = g.oppPicks.reduce((s,i)=>s+g.nums[i],0);
-  if (sY === sO) {
-    g.tiebreaker = true; g.yourTurn = true;
-    showToast('🤝 Ничья! Тайбрейк — выберите ещё 1 стаканчик!', 'gold');
-    renderGame();
-  } else {
-    g.done = true; offlineShowResult();
-  }
-}
-
-function offlineBotPick() {
-  const g = gameState;
-  const picked = new Set([...g.youPicks, ...g.oppPicks]);
-  const avail  = [0,1,2,3,4,5,6,7,8].filter(i=>!picked.has(i));
-  if (!avail.length) return;
-  const choice = avail[Math.floor(Math.random()*avail.length)];
-  animateOpponentCup(choice, () => {
-    g.oppPicks.push(choice);
-    if (g.youPicks.length + g.oppPicks.length === 6) {
-      setTimeout(offlineCheckTie, 700);
-    } else {
-      g.yourTurn = true; renderGame();
-    }
-  });
-}
-
-function offlineBotPickTb() {
-  const g = gameState;
-  const picked = new Set([...g.youPicks, ...g.oppPicks, g.tbYou]);
-  const avail  = [0,1,2,3,4,5,6,7,8].filter(i=>!picked.has(i));
-  if (!avail.length) return;
-  const choice = avail[Math.floor(Math.random()*avail.length)];
-  animateOpponentCup(choice, () => {
-    g.tbOpp = choice; g.done = true;
-    renderGame();
-    setTimeout(offlineShowResult, 800);
-  });
-}
-
-function offlineShowResult() {
-  const g = gameState;
-  const youScore = g.youPicks.reduce((s,i)=>s+g.nums[i],0) + (g.tbYou!=null?g.nums[g.tbYou]:0);
-  const oppScore = g.oppPicks.reduce((s,i)=>s+g.nums[i],0) + (g.tbOpp!=null?g.nums[g.tbOpp]:0);
-  const totalPot = g.stake * 2;
-  const commission = Math.floor(totalPot * 0.05);
-  const prize = totalPot - commission;
-  const youWin = youScore > oppScore;
-  const tie    = youScore === oppScore;
-
-  state.games++;
-  if (youWin) { state.wins++; state.balance += prize; state.earned += prize - g.stake; }
-  else if (tie) { state.balance += g.stake; }
-  renderLobby();
-
-  showResultWS({
-    winner_id:  youWin ? state.me.tg_id : tie ? null : g.opponent.tg_id,
-    picks_a: g.myRole==='creator' ? g.youPicks : g.oppPicks,
-    picks_b: g.myRole==='creator' ? g.oppPicks : g.youPicks,
-    tb_a: g.myRole==='creator' ? g.tbYou : g.tbOpp,
-    tb_b: g.myRole==='creator' ? g.tbOpp : g.tbYou,
-    nums: g.nums, prize, commission, total_pot: totalPot,
-    balances: { [state.me.tg_id]: state.balance },
-  });
-}
-
-function shuffleArr(arr) {
-  const a = [...arr];
-  for (let i=a.length-1;i>0;i--) {
-    const j=Math.floor(Math.random()*(i+1));
-    [a[i],a[j]]=[a[j],a[i]];
-  }
-  return a;
 }
 
 // ════════════════════ MESSAGE HANDLER ════════════════════
@@ -926,6 +772,7 @@ function handleMessage({ type, payload }) {
   switch (type) {
 
     case 'authed': {
+      connectAttempts = 1; // mark as connected at least once
       const { player, duels } = payload;
       state.balance = player.balance;
       state.wins    = player.wins;
@@ -941,9 +788,7 @@ function handleMessage({ type, payload }) {
       showToast('❌ ' + payload);
       break;
 
-    // ── LOBBY UPDATES ──
     case 'lobby_new_duel':
-      // не показывать свою дуэль в списке (она уже в waiting screen)
       if (payload.creator_id !== state.me?.tg_id) {
         state.duels.unshift(payload);
         renderLobby();
@@ -955,7 +800,6 @@ function handleMessage({ type, payload }) {
       renderLobby();
       break;
 
-    // ── DUEL CREATED ──
     case 'duel_created': {
       state.balance = payload.balance;
       state.currentDuel = payload.duel;
@@ -972,109 +816,81 @@ function handleMessage({ type, payload }) {
       showScreen('screen-lobby');
       break;
 
-    // ── GAME START ──
     case 'game_start': {
       const { duel, nums, creator, joiner, your_role, balance } = payload;
       if (balance !== undefined) state.balance = balance;
-
       const isCreator = your_role === 'creator';
       const opponent  = isCreator ? joiner : creator;
-
       gameState = {
-        duelId:     duel.id,
-        stake:      duel.stake,
-        nums,
-        myRole:     your_role,           // 'creator' | 'joiner'
-        myId:       state.me.tg_id,
-        creatorId:  creator.tg_id,
-        joinerId:   joiner.tg_id,
+        duelId: duel.id, stake: duel.stake, nums,
+        myRole: your_role, myId: state.me.tg_id,
+        creatorId: creator.tg_id, joinerId: joiner.tg_id,
         opponent,
-        youPicks:   [],
-        oppPicks:   [],
-        yourTurn:   isCreator,           // создатель ходит первым
-        tiebreaker: false,
-        tbYou: null, tbOpp: null,
+        youPicks: [], oppPicks: [],
+        yourTurn: isCreator,
+        tiebreaker: false, tbYou: null, tbOpp: null,
         done: false,
       };
-
-      document.getElementById('opp-name').textContent    = opponent.username;
+      document.getElementById('opp-name').textContent       = opponent.username;
       document.getElementById('hud-opp-avatar').textContent = opponent.avatar || '🎮';
-      document.getElementById('hud-you-avatar').textContent = state.me.avatar || '🎮';
-
-      if (your_role === 'creator') {
-        showToast(`${opponent.avatar || '🎮'} ${opponent.username} принял вызов!`, 'green');
-      }
-
+      document.getElementById('hud-you-avatar').textContent = state.me.avatar  || '🎮';
+      if (your_role === 'creator')
+        showToast(`${opponent.avatar||'🎮'} ${opponent.username} принял вызов!`, 'green');
+      else
+        showToast(`Игра началась! Ход создателя`, 'green');
       showScreen('screen-game');
       renderGame();
       break;
     }
 
-    // ── CUP PICKED (соперник выбрал) ──
     case 'cup_picked': {
       const { cup_index, picker_id, picks_a, picks_b, tb_a, tb_b, whose_turn, tiebreaker } = payload;
       const g = gameState;
       if (!g.duelId) break;
-
       const isCreator = g.myRole === 'creator';
-      // picks_a = creator picks, picks_b = joiner picks
-      g.youPicks  = isCreator ? picks_a : picks_b;
-      g.oppPicks  = isCreator ? picks_b : picks_a;
-      g.tbYou     = isCreator ? tb_a : tb_b;
-      g.tbOpp     = isCreator ? tb_b : tb_a;
+      g.youPicks   = isCreator ? picks_a : picks_b;
+      g.oppPicks   = isCreator ? picks_b : picks_a;
+      g.tbYou      = isCreator ? tb_a : tb_b;
+      g.tbOpp      = isCreator ? tb_b : tb_a;
       g.tiebreaker = tiebreaker;
-      g.yourTurn  = (whose_turn === g.myId);
-
-      // анимируем стаканчик соперника
-      if (picker_id !== g.myId) {
+      g.yourTurn   = (whose_turn === g.myId);
+      if (picker_id !== g.myId)
         animateOpponentCup(cup_index, () => renderGame());
-      } else {
+      else
         renderGame();
-      }
       break;
     }
 
-    // ── TIEBREAKER ──
     case 'tiebreaker': {
       const { picks_a, picks_b, whose_turn } = payload;
       const g = gameState;
       if (!g.duelId) break;
-
       const isCreator = g.myRole === 'creator';
       g.youPicks   = isCreator ? picks_a : picks_b;
       g.oppPicks   = isCreator ? picks_b : picks_a;
       g.tiebreaker = true;
       g.yourTurn   = (whose_turn === g.myId);
-
       showToast('🤝 Ничья! Тайбрейк — выберите ещё 1 стаканчик!', 'gold');
       renderGame();
       break;
     }
 
-    // ── GAME OVER ──
     case 'game_over': {
       const { winner_id, picks_a, picks_b, tb_a, tb_b, nums,
               prize, commission, total_pot, balances } = payload;
       const g = gameState;
       if (!g.duelId) break;
-
       const isCreator = g.myRole === 'creator';
-      g.youPicks  = isCreator ? picks_a : picks_b;
-      g.oppPicks  = isCreator ? picks_b : picks_a;
-      g.tbYou     = isCreator ? tb_a : tb_b;
-      g.tbOpp     = isCreator ? tb_b : tb_a;
-      g.nums      = nums;
-      g.done      = true;
-
-      const myNewBalance = balances[g.myId];
-      if (myNewBalance !== undefined) state.balance = myNewBalance;
-
+      g.youPicks = isCreator ? picks_a : picks_b;
+      g.oppPicks = isCreator ? picks_b : picks_a;
+      g.tbYou    = isCreator ? tb_a : tb_b;
+      g.tbOpp    = isCreator ? tb_b : tb_a;
+      g.nums     = nums; g.done = true;
+      const myBal = balances[g.myId];
+      if (myBal !== undefined) state.balance = myBal;
       state.games++;
       if (winner_id === g.myId) { state.wins++; state.earned += prize - g.stake; }
-
-      renderGame();
-      renderLobby();
-
+      renderGame(); renderLobby();
       setTimeout(() => showResultWS(payload), 900);
       break;
     }
@@ -1083,25 +899,30 @@ function handleMessage({ type, payload }) {
       state.duels = payload.duels;
       renderLobby();
       break;
+
+    case 'balance_update':
+      state.balance = payload.balance;
+      renderLobby();
+      showToast(payload.reason || '💰 Баланс обновлён', 'green');
+      break;
   }
 }
 
 // ════════════════════ RENDER LOBBY ════════════════════
 function renderLobby() {
   document.getElementById('balance-display').textContent = fmt(state.balance);
-  document.getElementById('stat-wins').textContent  = state.wins;
-  document.getElementById('stat-games').textContent = state.games;
-  document.getElementById('stat-earned').textContent = fmt(state.earned);
+  document.getElementById('stat-wins').textContent       = state.wins;
+  document.getElementById('stat-games').textContent      = state.games;
+  document.getElementById('stat-earned').textContent     = fmt(state.earned);
 
-  const list = document.getElementById('duels-list');
+  const list    = document.getElementById('duels-list');
   const waiting = state.duels.filter(d => d.status === 'waiting');
 
   if (waiting.length === 0) {
     list.innerHTML = `<div class="empty-state"><div class="icon">🏜️</div><p>Нет активных дуэлей.<br>Создайте первую!</p></div>`;
     return;
   }
-
-  list.innerHTML = waiting.map((d) => {
+  list.innerHTML = waiting.map(d => {
     const isOwn = d.creator_id === state.me?.tg_id;
     return `
     <div class="duel-card">
@@ -1112,7 +933,7 @@ function renderLobby() {
       <div class="duel-players">
         <div class="player-slot">
           <div class="player-avatar">🎮</div>
-          <div class="player-name">${isOwn ? 'Вы' : 'Игрок'}</div>
+          <div class="player-name">${isOwn ? '👤 Вы' : '👤 Игрок'}</div>
         </div>
         <div class="vs-badge">VS</div>
         <div class="player-slot">
@@ -1135,101 +956,73 @@ function renderLobby() {
 function fmt(n) { return Number(n).toLocaleString('ru'); }
 
 // ════════════════════ MODAL ════════════════════
-function openCreateModal() {
-  document.getElementById('create-modal').classList.add('active');
-  updateCreateBtn();
-}
-function closeModal() {
-  document.getElementById('create-modal').classList.remove('active');
-}
-function setStake(v) {
-  document.getElementById('stake-input').value = v;
-  state.currentStake = v;
-  updateCreateBtn();
-}
-function updateCreateBtn() {
+function openCreateModal() { document.getElementById('create-modal').classList.add('active'); updateCreateBtn(); }
+function closeModal()       { document.getElementById('create-modal').classList.remove('active'); }
+function setStake(v)        { document.getElementById('stake-input').value = v; updateCreateBtn(); }
+function updateCreateBtn()  {
   const v = parseInt(document.getElementById('stake-input').value) || 100;
-  state.currentStake = v;
   document.getElementById('create-btn-stake').textContent = fmt(v);
 }
 document.getElementById('stake-input').addEventListener('input', updateCreateBtn);
 
 function createDuel() {
   const stake = parseInt(document.getElementById('stake-input').value) || 100;
-  if (stake < 10)             { showToast('Минимальная ставка — 10 монет'); return; }
-  if (stake > state.balance)  { showToast('Недостаточно монет! 💸'); return; }
+  if (stake < 10)            { showToast('Минимальная ставка — 10 монет'); return; }
+  if (stake > state.balance) { showToast('Недостаточно монет! 💸'); return; }
   closeModal();
   wsSend('create_duel', { stake });
 }
-
 function cancelWaiting() {
-  if (state.currentDuel) {
-    wsSend('cancel_duel', { duel_id: state.currentDuel.id });
-  }
+  if (state.currentDuel) wsSend('cancel_duel', { duel_id: state.currentDuel.id });
 }
-
-function cancelDuel(duelId) {
-  wsSend('cancel_duel', { duel_id: duelId });
-}
-
-// ════════════════════ JOIN DUEL ════════════════════
-function joinDuel(duelId, stake) {
+function cancelDuel(id) { wsSend('cancel_duel', { duel_id: id }); }
+function joinDuel(id, stake) {
   if (stake > state.balance) { showToast('Недостаточно монет! 💸'); return; }
-  wsSend('join_duel', { duel_id: duelId });
+  wsSend('join_duel', { duel_id: id });
 }
+function goLobby() { wsSend('get_lobby', {}); showScreen('screen-lobby'); }
 
-function goLobby() {
-  wsSend('get_lobby', {});
-  showScreen('screen-lobby');
-}
-
-// ════════════════════ GAME STATE & RENDER ════════════════════
-let gameState = {};
-
+// ════════════════════ GAME RENDER ════════════════════
 function renderGame() {
   const g = gameState;
   if (!g.nums) return;
 
   const picked = new Set([
     ...g.youPicks, ...g.oppPicks,
-    ...(g.tbYou !== null && g.tbYou !== undefined ? [g.tbYou] : []),
-    ...(g.tbOpp !== null && g.tbOpp !== undefined ? [g.tbOpp] : []),
+    ...(g.tbYou != null ? [g.tbYou] : []),
+    ...(g.tbOpp != null ? [g.tbOpp] : []),
   ]);
 
-  // scores
   const you = g.youPicks.reduce((s,i)=>s+g.nums[i],0) + (g.tbYou!=null ? g.nums[g.tbYou] : 0);
   const opp = g.oppPicks.reduce((s,i)=>s+g.nums[i],0) + (g.tbOpp!=null ? g.nums[g.tbOpp] : 0);
   document.getElementById('score-you').textContent = you;
   document.getElementById('score-opp').textContent = opp;
 
-  // banner
   const banner = document.getElementById('turn-banner');
   if (g.done) {
     banner.textContent = ''; banner.className = 'turn-banner';
   } else if (g.tiebreaker) {
-    banner.innerHTML   = g.yourTurn ? '⚡ ТАЙБРЕЙК — выберите 1 стаканчик!' : '⏳ Тайбрейк — ход соперника...';
-    banner.className   = g.yourTurn ? 'turn-banner tiebreaker' : 'turn-banner waiting';
+    banner.innerHTML = g.yourTurn ? '⚡ ТАЙБРЕЙК — выберите 1 стаканчик!' : '⏳ Тайбрейк — ход соперника...';
+    banner.className = g.yourTurn ? 'turn-banner tiebreaker' : 'turn-banner waiting';
   } else {
     banner.textContent = g.yourTurn ? '🟢 ВАШ ХОД — выберите стаканчик' : '⏳ Ход соперника...';
     banner.className   = g.yourTurn ? 'turn-banner' : 'turn-banner waiting';
   }
 
-  // phase dots
   const donePicks = g.youPicks.length + g.oppPicks.length
-                  + (g.tbYou != null ? 1 : 0) + (g.tbOpp != null ? 1 : 0);
+                  + (g.tbYou!=null?1:0) + (g.tbOpp!=null?1:0);
   const totalDots = g.tiebreaker ? 8 : 6;
-  document.getElementById('phase-dots').innerHTML = Array.from({length: totalDots}, (_, i) => {
+  document.getElementById('phase-dots').innerHTML = Array.from({length:totalDots},(_,i) => {
     const isTb = i >= 6;
     return `<div class="phase-dot ${isTb?'tb-dot':''} ${i<donePicks?'done':i===donePicks?'active':''}"></div>`;
   }).join('');
 
-  // cups grid
   document.getElementById('cups-grid').innerHTML = g.nums.map((num, i) => {
     const isYou   = g.youPicks.includes(i);
     const isOpp   = g.oppPicks.includes(i);
     const isTbYou = g.tbYou === i;
     const isTbOpp = g.tbOpp === i;
-    const revealed = isYou || isOpp || isTbYou || isTbOpp;
+    const revealed = isYou||isOpp||isTbYou||isTbOpp;
     const avail    = !picked.has(i) && g.yourTurn && !g.done;
 
     let cls = 'cup-cell';
@@ -1244,68 +1037,57 @@ function renderGame() {
                 : isTbOpp ? `<span class="cup-badge badge-opp">⚡Оп</span>`
                 : isYou   ? `<span class="cup-badge badge-you">Вы</span>`
                 : isOpp   ? `<span class="cup-badge badge-opp">Оп</span>` : '';
-    const numColor = (isYou||isTbYou) ? 'var(--gold)' : (isOpp||isTbOpp) ? 'var(--red)' : 'var(--text)';
+    const numColor = (isYou||isTbYou)?'var(--gold)':(isOpp||isTbOpp)?'var(--red)':'var(--text)';
 
     return `<div class="${cls}" onclick="pickCup(${i})">
       <div class="cup-icon">🥤</div>
-      <div class="cup-number" style="color:${numColor}">${revealed ? num : ''}</div>
+      <div class="cup-number" style="color:${numColor}">${revealed?num:''}</div>
       ${badge}
     </div>`;
   }).join('');
 
-  // picks row
-  const oppAvatar = g.opponent?.avatar || '🎮';
-  const youStr    = g.youPicks.map(i=>`<span class="pick-chip filled-you">🥤 ${g.nums[i]}</span>`).join('');
-  const oppStr    = g.oppPicks.map(i=>`<span class="pick-chip filled-opp">🥤 ${g.nums[i]}</span>`).join('');
-  const eYou      = Array.from({length:3-g.youPicks.length},()=>`<span class="pick-chip">?</span>`).join('');
-  const eOpp      = Array.from({length:3-g.oppPicks.length},()=>`<span class="pick-chip">?</span>`).join('');
-  const tbYouStr  = g.tiebreaker ? ' '+(g.tbYou!=null?`<span class="pick-chip filled-you tb-chip">⚡${g.nums[g.tbYou]}</span>`:`<span class="pick-chip tb-chip">⚡?</span>`) : '';
-  const tbOppStr  = g.tiebreaker ? ' '+(g.tbOpp!=null?`<span class="pick-chip filled-opp tb-chip">⚡${g.nums[g.tbOpp]}</span>`:`<span class="pick-chip tb-chip">⚡?</span>`) : '';
+  const oppAv  = g.opponent?.avatar||'🎮';
+  const youStr = g.youPicks.map(i=>`<span class="pick-chip filled-you">🥤 ${g.nums[i]}</span>`).join('');
+  const oppStr = g.oppPicks.map(i=>`<span class="pick-chip filled-opp">🥤 ${g.nums[i]}</span>`).join('');
+  const eYou   = Array.from({length:3-g.youPicks.length},()=>`<span class="pick-chip">?</span>`).join('');
+  const eOpp   = Array.from({length:3-g.oppPicks.length},()=>`<span class="pick-chip">?</span>`).join('');
+  const tbYouStr = g.tiebreaker?' '+(g.tbYou!=null?`<span class="pick-chip filled-you tb-chip">⚡${g.nums[g.tbYou]}</span>`:`<span class="pick-chip tb-chip">⚡?</span>`):'';
+  const tbOppStr = g.tiebreaker?' '+(g.tbOpp!=null?`<span class="pick-chip filled-opp tb-chip">⚡${g.nums[g.tbOpp]}</span>`:`<span class="pick-chip tb-chip">⚡?</span>`):'';
   document.getElementById('picks-row').innerHTML =
-    `😎 ${youStr}${eYou}${tbYouStr} &nbsp;|&nbsp; ${oppAvatar} ${oppStr}${eOpp}${tbOppStr}`;
+    `😎 ${youStr}${eYou}${tbYouStr} &nbsp;|&nbsp; ${oppAv} ${oppStr}${eOpp}${tbOppStr}`;
 }
 
-// ════════════════════ PICK CUP → WebSocket ════════════════════
+// ════════════════════ PICK CUP ════════════════════
 function pickCup(i) {
   const g = gameState;
   if (!g.yourTurn || g.done) return;
-
   const allPicked = [...g.youPicks, ...g.oppPicks,
-    ...(g.tbYou != null ? [g.tbYou] : []),
-    ...(g.tbOpp != null ? [g.tbOpp] : [])];
+    ...(g.tbYou!=null?[g.tbYou]:[]), ...(g.tbOpp!=null?[g.tbOpp]:[])];
   if (allPicked.includes(i)) return;
   if (!g.tiebreaker && g.youPicks.length >= 3) return;
-
-  if (offlineMode) {
-    wsSend('pick_cup', { cup_index: i });
-    return;
-  }
-
-  // онлайн — блокируем кнопки пока ждём ответ сервера
   g.yourTurn = false;
   renderGame();
   wsSend('pick_cup', { duel_id: g.duelId, cup_index: i });
 }
 
-// анимация стаканчика соперника
+// анимация выбора соперника
 function animateOpponentCup(idx, callback) {
   const cells = document.querySelectorAll('.cup-cell');
   const cell  = cells[idx];
   if (!cell) { callback(); return; }
   let blinks = 0;
   const iv = setInterval(() => {
-    cell.style.borderColor = blinks%2===0 ? 'var(--red)' : 'var(--border)';
-    cell.style.background  = blinks%2===0 ? 'rgba(255,59,59,0.15)' : '';
+    cell.style.borderColor = blinks%2===0?'var(--red)':'var(--border)';
+    cell.style.background  = blinks%2===0?'rgba(255,59,59,0.15)':'';
     if (++blinks >= 5) {
       clearInterval(iv);
-      cell.style.borderColor = '';
-      cell.style.background  = '';
+      cell.style.borderColor=''; cell.style.background='';
       callback();
     }
   }, 180);
 }
 
-// ════════════════════ SHOW RESULT (WS data) ════════════════════
+// ════════════════════ RESULT ════════════════════
 function showResultWS({ winner_id, picks_a, picks_b, tb_a, tb_b, nums,
                         prize, commission, total_pot }) {
   const g = gameState;
@@ -1315,15 +1097,15 @@ function showResultWS({ winner_id, picks_a, picks_b, tb_a, tb_b, nums,
   const tbYou     = isCreator ? tb_a : tb_b;
   const tbOpp     = isCreator ? tb_b : tb_a;
 
-  const youScore = youPicks.reduce((s,i)=>s+nums[i],0) + (tbYou!=null ? nums[tbYou] : 0);
-  const oppScore = oppPicks.reduce((s,i)=>s+nums[i],0) + (tbOpp!=null ? nums[tbOpp] : 0);
+  const youScore = youPicks.reduce((s,i)=>s+nums[i],0) + (tbYou!=null?nums[tbYou]:0);
+  const oppScore = oppPicks.reduce((s,i)=>s+nums[i],0) + (tbOpp!=null?nums[tbOpp]:0);
   const youWin   = winner_id === g.myId;
   const tie      = winner_id === null;
 
-  document.getElementById('result-icon').textContent = youWin ? '🏆' : tie ? '🤝' : '💀';
+  document.getElementById('result-icon').textContent = youWin?'🏆':tie?'🤝':'💀';
   const rt = document.getElementById('result-title');
-  rt.textContent = youWin ? 'ПОБЕДА!' : tie ? 'НИЧЬЯ' : 'ПОРАЖЕНИЕ';
-  rt.className   = `result-title ${youWin ? 'result-win' : 'result-lose'}`;
+  rt.textContent = youWin?'ПОБЕДА!':tie?'НИЧЬЯ':'ПОРАЖЕНИЕ';
+  rt.className   = `result-title ${youWin?'result-win':'result-lose'}`;
   document.getElementById('result-subtitle').textContent =
     youWin ? `Ваши очки: ${youScore} vs ${oppScore} — вы выиграли!` :
     tie    ? `Оба набрали ${youScore} — ставки возвращены` :
@@ -1331,7 +1113,7 @@ function showResultWS({ winner_id, picks_a, picks_b, tb_a, tb_b, nums,
 
   const youMain  = youPicks.map(i=>nums[i]);
   const oppMain  = oppPicks.map(i=>nums[i]);
-  const tbRow    = (tb_a !== null || tb_b !== null) ? `
+  const tbRow    = (tbYou!=null||tbOpp!=null) ? `
     <div class="breakdown-row" style="background:rgba(255,215,0,0.05);border-radius:8px;padding:8px;">
       <span class="lbl">⚡ Тайбрейк</span>
       <span class="val" style="font-size:12px">
@@ -1348,28 +1130,25 @@ function showResultWS({ winner_id, picks_a, picks_b, tb_a, tb_b, nums,
     <div class="breakdown-row"><span class="lbl">Общий банк</span><span class="val">${fmt(total_pot)} монет</span></div>
     <div class="breakdown-row"><span class="lbl">Комиссия (5%)</span><span class="val" style="color:var(--muted)">−${fmt(commission)}</span></div>
     <div class="breakdown-row"><span class="lbl">${youWin?'Вы получаете':tie?'Возврат':'Соперник получает'}</span>
-      <span class="val highlight">${fmt(youWin ? prize : tie ? g.stake : prize)} монет</span></div>
+      <span class="val highlight">${fmt(youWin?prize:tie?g.stake:prize)} монет</span></div>
   `;
-
   showScreen('screen-result');
 }
 
 // ════════════════════ UTILS ════════════════════
 function showScreen(id) {
-  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
 }
-
 function showToast(msg, type='') {
   const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.className = `toast ${type} show`;
-  setTimeout(() => t.classList.remove('show'), 2800);
+  t.textContent = msg; t.className = `toast ${type} show`;
+  setTimeout(()=>t.classList.remove('show'), 2800);
 }
 
 // ════════════════════ INIT ════════════════════
+showScreen('screen-connecting');
 wsConnect();
-
 </script>
 </body>
 </html>
